@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>Title</title>
+</head>
+<body>
+<div class="config">
+    <h3>服务器配置</h3>
+    <form action="http://localhost:8080/cofnig">
+        <p>
+            <label>
+                服务器IP:
+                <input type="text" placeholder="输入同步服务器IP">
+            </label>
+        </p>
+        <p>
+            <label>
+                服务器端口:
+                <input type="number" placeholder="输入服务器端口号">
+            </label>
+        </p>
+        <p>
+            <label>
+                同步文件夹:
+                <input type="text" placeholder="输入同步文件夹">
+            </label>
+        </p>
+        <p>
+            <input type="submit" value="提交">
+        </p>
+    </form>
+</div>
+<div class="operate">
+    <h3>操作</h3>
+    <p>当前状态：正在监听/home/hzfui</p>
+    <button>同步本地文件</button>
+    <button>同步文件</button>
+    <button>同步远程文件</button>
+</div>
+</body>
+</html>

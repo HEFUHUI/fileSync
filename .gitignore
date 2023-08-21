@@ -2,3 +2,4 @@
 *.exe
 fileSync
 target
+dist

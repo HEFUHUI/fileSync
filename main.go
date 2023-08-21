@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fileSync/utils"
 	"fmt"
 	"github.com/fsnotify/fsnotify"
 	"github.com/gin-gonic/gin"
@@ -10,45 +11,141 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
+)
+
+const (
+	targetDir  = "./target"
+	targetHost = "127.0.0.1"
+	targetPort = 8081
 )
 
 func init() {
-	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	log.SetFlags(log.Ltime | log.Lshortfile)
 	var err error
 	watcher, err = fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
 	}
+	config = utils.NewConfig()
+	if config == nil {
+		config = new(utils.Config)
+		config.TargetDir = targetDir
+		config.TargetHost = targetHost
+		config.TargetPort = targetPort
+		config.Listen = 6789
+	}
 	formatTargetDir()
 }
 
 var (
-	targetDir  = "./target"
-	targetHost = "127.0.0.1"
-	targetPort = "8080"
-	watcher    *fsnotify.Watcher
+	config  *utils.Config
+	watcher *fsnotify.Watcher
+	reload  = make(chan struct{}, 10)
 )
 
 func main() {
 	engine := gin.Default()
-	engine.GET("/", func(context *gin.Context) {
+	gin.SetMode(gin.ReleaseMode)
+	engine.Use(gin.Recovery())
+	engine.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
+		return fmt.Sprintf("%s - [%s] \"%s %s %s %d %s \"%s\" %s\"\n",
+			param.ClientIP,
+			param.TimeStamp.Format(time.RFC1123),
+			param.Method,
+			param.Path,
+			param.Request.Proto,
+			param.StatusCode,
+			param.Latency,
+			param.Request.UserAgent(),
+			param.ErrorMessage,
+		)
+	}))
+	if _, err := os.Stat(config.TargetDir); err != nil {
+		log.Println("目标文件夹不存在, 创建文件夹: ", config.TargetDir)
+		_ = os.MkdirAll(config.TargetDir, os.ModePerm)
+	}
+	log.Println("开始监听: ", config.TargetDir)
+	go func() {
+		err := watchDir(config.TargetDir)
+		if err != nil {
+			log.Println(err)
+		}
+	}()
+	engine.GET("/refresh", func(context *gin.Context) {
+		_ = reloadWatch(config.TargetDir)
+		context.Redirect(302, "/")
+	})
+	engine.POST("/config", func(context *gin.Context) {
+		config.TargetHost = context.DefaultPostForm("targetHost", config.TargetHost)
+		targetPort := context.DefaultPostForm("targetPort", fmt.Sprintf("%d", targetPort))
+		config.TargetPort = utils.StringToInt(targetPort)
+		config.Listen = utils.StringToInt(context.DefaultPostForm("listen",
+			fmt.Sprintf("%d", config.Listen)))
+		config.TargetDir = context.PostForm("targetDir")
+		config.Ignored = strings.Trim(context.PostForm("ignored"), ",")
+		formatTargetDir()
+		for len(watcher.WatchList()) > 0 {
+			_ = watcher.Remove(watcher.WatchList()[0])
+		}
+		_ = reloadWatch(config.TargetDir)
+		// 写入配置文件
+		if err := utils.WriteConfig(config); err != nil {
+			context.JSON(500, gin.H{
+				"message": err.Error(),
+			})
+			return
+		}
+		context.Redirect(302, "/")
+	})
+	engine.GET("/start", func(context *gin.Context) {
 		go func() {
-			err := watchDir(targetDir)
+			err := watchDir(config.TargetDir)
 			if err != nil {
 				log.Println(err)
 			}
 		}()
-		context.JSON(200, gin.H{
+		context.Redirect(302, "/")
+	})
+	engine.GET("/", func(context *gin.Context) {
+		context.Header("Content-Type", "text/html; charset=utf-8")
+		_, err := context.Writer.WriteString(config.GetConfigPage(watcher))
+		if err != nil {
+			context.JSON(500, gin.H{
+				"message": err.Error(),
+			})
+			return
+		}
+	})
+	engine.PUT("/sync", func(context *gin.Context) {
+		//手动同步文件夹
+		action := context.Query("action")
+		if action == "" {
+			context.JSON(500, &gin.H{
+				"message": "请提供操作",
+			})
+			return
+		}
+		switch action {
+		case "remote":
+			err := copyRemote()
+			if err != nil {
+				context.JSON(500, &gin.H{
+					"message": err.Error(),
+				})
+			}
+		}
+		context.JSON(200, &gin.H{
 			"message": "ok",
 		})
 	})
 	engine.POST("/sync", func(context *gin.Context) {
-		_ = watcher.Remove(targetDir)
+		removeAllWatch()
 		action := context.Query("action")
 		fileName := context.Query("fileName")
-		fileName = strings.ReplaceAll(fileName, "1100", "\\")
+		fileName = strings.ReplaceAll(fileName, "1100", "/")
 		if action == "delete" {
-			err := removeFile(path.Join(targetDir, fileName))
+			err := removeFile(path.Join(config.TargetDir, fileName))
 			if err != nil {
 				log.Printf("remove file %s error: %s\n", fileName, err.Error())
 				context.JSON(500, gin.H{
@@ -62,7 +159,7 @@ func main() {
 			return
 		} else if action == "rename" {
 			newFileName := context.Query("newFileName")
-			if err := os.Rename(path.Join(targetDir, fileName), path.Join(targetDir, newFileName)); err != nil {
+			if err := os.Rename(path.Join(config.TargetDir, fileName), path.Join(config.TargetDir, newFileName)); err != nil {
 				log.Printf("rename file %s error: %s\n", fileName, err.Error())
 				context.JSON(500, gin.H{
 					"message": err.Error(),
@@ -74,9 +171,9 @@ func main() {
 			})
 			return
 		} else if action == "mkdir" {
-			err := os.Mkdir(path.Join(targetDir, fileName), os.ModePerm)
-			log.Printf("mkdir %s error: %s\n", fileName, err.Error())
+			err := os.Mkdir(path.Join(config.TargetDir, fileName), os.ModePerm)
 			if err != nil {
+				log.Printf("mkdir %s error: %s\n", fileName, err.Error())
 				context.JSON(500, gin.H{
 					"message": err.Error(),
 				})
@@ -85,10 +182,24 @@ func main() {
 			context.JSON(200, gin.H{
 				"message": "ok",
 			})
+			reload <- struct{}{}
 			return
 		} else if action == "upload" {
 			log.Printf("upload file %s\n", fileName)
-			targetFileName := path.Join(targetDir, fileName)
+			targetFileName := path.Join(config.TargetDir, fileName)
+			dir := path.Dir(targetFileName)
+			// 判断是否是存在
+			if _, err := os.Stat(dir); err != nil {
+				if os.IsNotExist(err) {
+					// 不存在, 创建文件夹
+					err := os.MkdirAll(dir, os.ModePerm)
+					if err != nil {
+						log.Println(err)
+					}
+				} else {
+					log.Println(err)
+				}
+			}
 			bytes, _ := io.ReadAll(context.Request.Body)
 			err := os.WriteFile(targetFileName, bytes, os.ModePerm)
 			if err != nil {
@@ -98,12 +209,55 @@ func main() {
 				return
 			}
 		}
-		_ = watcher.Add(targetDir)
+		err := reloadWatch(config.TargetDir)
+		if err != nil {
+			context.JSON(500, gin.H{
+				"message": err.Error(),
+			})
+			return
+		}
 		context.JSON(200, gin.H{
 			"message": "ok",
 		})
 	})
-	log.Fatal(engine.Run(":8081"))
+	log.Println("监听端口: ", config.Listen)
+	log.Fatal(engine.Run(fmt.Sprintf(":%d", config.Listen)))
+}
+
+func copyRemote() error {
+	return sendDir(config.TargetDir)
+}
+
+func sendDir(dir string) error {
+	dirFileList, err := os.ReadDir(dir)
+	if err != nil {
+		log.Println("同步失败：" + err.Error())
+		return err
+	}
+	for _, item := range dirFileList {
+		if matchIgnore(item.Name()) {
+			continue
+		}
+		if item.IsDir() {
+			err := sendDir(path.Join(dir, item.Name()))
+			if err != nil {
+				log.Printf("文件夹：%s, 同步失败：%s", item.Name(), err.Error())
+			}
+		} else {
+			file, err := os.OpenFile(path.Join(dir, item.Name()), os.O_RDONLY, 0666)
+			if err != nil {
+				log.Printf("文件: %s,读取失败: %s", item.Name(), err.Error())
+			}
+			if err = sendHttpRequest(RequestModel{
+				Action:   "upload",
+				Body:     file,
+				FileName: path.Join(dir, item.Name()),
+			}); err != nil {
+				log.Printf("文件: %s,同步失败: %s", item.Name(), err.Error())
+			}
+		}
+	}
+	return nil
 }
 
 func removeFile(fileName string) error {
@@ -113,8 +267,32 @@ func removeFile(fileName string) error {
 	}
 	return nil
 }
-func watchDir(dir string) error {
+
+func reloadWatch(dir string) error {
+	removeAllWatch()
 	err := watcher.Add(dir)
+	subDir := utils.GetSubDir(dir)
+	for _, newDir := range subDir {
+		if matchIgnore(newDir) {
+			log.Println("忽略文件夹: ", newDir)
+			continue
+		}
+		err = watcher.Add(newDir)
+		if err != nil {
+			log.Printf("文件夹 %s 监听添加失败: %v", newDir, err)
+		}
+	}
+	return err
+}
+
+func removeAllWatch() {
+	for len(watcher.WatchList()) > 0 {
+		_ = watcher.Remove(watcher.WatchList()[0])
+	}
+}
+
+func watchDir(dir string) error {
+	err := reloadWatch(dir)
 	if err != nil {
 		return err
 	}
@@ -139,7 +317,7 @@ func watchDir(dir string) error {
 				log.Printf("create file: %s\n", event.Name)
 				fileInfo, err := os.Stat(event.Name)
 				if err != nil {
-					log.Println(err)
+					log.Println("create file error:", err)
 					continue
 				}
 				if fileInfo.IsDir() {
@@ -161,7 +339,7 @@ func watchDir(dir string) error {
 						FileName: event.Name,
 						Body:     file,
 					}); err != nil {
-						log.Println(err)
+						log.Println("create remote file error:", err)
 					}
 				}
 			} else if event.Op&fsnotify.Remove == fsnotify.Remove {
@@ -179,7 +357,7 @@ func watchDir(dir string) error {
 					Action:   "delete",
 					FileName: event.Name,
 				}); err != nil {
-					log.Println(err)
+					log.Println("remove remote file error:", err)
 				}
 			} else if event.Op&fsnotify.Rename == fsnotify.Rename {
 				log.Printf("rename file: %s\n", event.Name)
@@ -188,25 +366,37 @@ func watchDir(dir string) error {
 					Action:   "delete",
 					FileName: event.Name,
 				}); err != nil {
-					log.Println(err)
+					log.Println("remove remote file error:", err)
 				}
 			}
 		case err := <-watcher.Errors:
 			log.Println("error:", err)
+		case <-time.After(time.Second * 1):
+			if len(watcher.WatchList()) < 1 {
+				err := reloadWatch(dir)
+				if err != nil {
+					log.Println("reload watch error:", err)
+				}
+			}
 		}
 	}
 }
 
 func sendHttpRequest(req RequestModel) error {
+	if matchIgnore(req.FileName) {
+		log.Println("忽略文件: ", req.FileName)
+		return nil
+	}
 	var err error
 	var response *http.Response
-	req.FileName = strings.ReplaceAll(req.FileName, targetDir, "")
-	if strings.HasPrefix(req.FileName, "\\") {
-		req.FileName = strings.Replace(req.FileName, "\\", "", 1)
+	req.FileName = req.FileName[len(config.TargetDir):]
+	if strings.HasPrefix(req.FileName, "\\") || strings.HasPrefix(req.FileName, "/") {
+		req.FileName = req.FileName[1:]
 	}
-	// 将/替换为\
 	req.FileName = strings.ReplaceAll(req.FileName, "\\", "1100")
-	url := fmt.Sprintf("http://%s:%s/sync?action=%s&fileName=%s", targetHost, targetPort, req.Action, req.FileName)
+	req.FileName = strings.ReplaceAll(req.FileName, "/", "1100")
+	req.FileName = strings.ReplaceAll(req.FileName, " ", "1200")
+	url := fmt.Sprintf("http://%s:%d/sync?action=%s&fileName=%s", config.TargetHost, config.TargetPort, req.Action, req.FileName)
 	if req.Body != nil {
 		response, err = http.Post(url, "binary/octet-stream", req.Body)
 	} else {
@@ -217,7 +407,6 @@ func sendHttpRequest(req RequestModel) error {
 		log.Println(err)
 		return err
 	}
-	log.Println("response status code is", response.StatusCode)
 	if response.StatusCode != 200 {
 		contentType := response.Header["Content-Type"]
 		if len(contentType) > 0 && strings.Contains(contentType[0], "application/json") {
@@ -227,22 +416,39 @@ func sendHttpRequest(req RequestModel) error {
 		}
 		return fmt.Errorf("response status code is %d", response.StatusCode)
 	} else {
-		log.Println("response status code is 200")
+		log.Printf("file %s sync success", req.FileName)
 	}
 	return nil
 }
 
 func formatTargetDir() {
-	if strings.HasPrefix(targetDir, "./") {
-		targetDir = strings.ReplaceAll(targetDir, "./", "")
-	}
-	if strings.HasPrefix(targetDir, "/") {
-		targetDir = strings.Replace(targetDir, "/", "", 1)
-	}
+	config.TargetDir = path.Clean(config.TargetDir)
 }
 
 type RequestModel struct {
 	Action   string   `json:"action"`
 	Body     *os.File `json:"body"`
 	FileName string   `json:"fileName"`
+}
+
+func matchIgnore(fileName string) bool {
+	name := path.Base(fileName)
+	for _, ignoreItem := range config.GetIgnoreList() {
+		// 如果item是以/结尾的，说明是文件夹
+		if strings.HasSuffix(ignoreItem, "/") {
+			ignoreItem = strings.ReplaceAll(ignoreItem, "/", "")
+			// 如果文件名包含ignoreItem，说明是文件夹，并且不是以ignoreItem结尾的
+			if strings.Contains(name, ignoreItem) {
+				return true
+			}
+		}
+		// 如果item包含*，说明是通配符
+		if strings.Contains(ignoreItem, "*") {
+			ignoreItem = strings.ReplaceAll(ignoreItem, "*", "")
+			if strings.HasPrefix(name, ignoreItem) || strings.HasSuffix(name, ignoreItem) {
+				return true
+			}
+		}
+	}
+	return false
 }

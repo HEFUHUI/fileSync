@@ -1,0 +1,1 @@
+{"listen":6789,"targetDir":"target","targetHost":"127.0.0.1","targetPort":6780,"ignored":"*.sh,checkasm/"}

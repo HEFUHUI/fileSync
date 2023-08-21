@@ -7,23 +7,23 @@
 <body>
 <div class="config">
     <h3>服务器配置</h3>
-    <form action="http://localhost:8080/cofnig">
+    <form action="/config" method="post" enctype="application/json">
         <p>
             <label>
                 服务器IP:
-                <input type="text" placeholder="输入同步服务器IP">
+                <input type="text" value="%s" name="targetHost" placeholder="输入同步服务器IP">
             </label>
         </p>
         <p>
             <label>
                 服务器端口:
-                <input type="number" placeholder="输入服务器端口号">
+                <input type="number" value="%d" name="targetPort" placeholder="输入服务器端口号">
             </label>
         </p>
         <p>
             <label>
                 同步文件夹:
-                <input type="text" placeholder="输入同步文件夹">
+                <input type="text" value="%s" name="targetDir" placeholder="输入同步文件夹">
             </label>
         </p>
         <p>
@@ -33,10 +33,33 @@
 </div>
 <div class="operate">
     <h3>操作</h3>
-    <p>当前状态：正在监听/home/hzfui</p>
-    <button>同步本地文件</button>
-    <button>同步文件</button>
-    <button>同步远程文件</button>
+    <p>监听文件夹列表：%v</p>
+    <button id="startBtn" onclick="startWatcher()">启动监听</button>
+    <button onclick="syncLocal()">同步本地到远程</button>
+    <div id="result" style="width: 500px; height: 300px"></div>
+    <!--    <button>同步文件</button>-->
+    <!--    <button>同步远程文件</button>-->
 </div>
+<script>
+    window.onload = function (){
+        startBtn.style.display = %v ? 'none' : 'block';
+    }
+    function startWatcher(){
+        window.location.href = "/start";
+    }
+    function syncLocal(){
+        const result = document.getElementById("result");
+        result.style.display = "block"
+        fetch("/sync?action=remote", {
+            method: 'put',
+        }).catch(err=>{
+            result.innerText = err;
+        }).then(res=>{
+            return res.json()
+        }).then(msg=>{
+            result.innerText = msg['message']
+        })
+    }
+</script>
 </body>
 </html>
